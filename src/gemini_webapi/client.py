@@ -188,6 +188,8 @@ class GeminiClient(ChatMixin, GemMixin, ResearchMixin):
         self._quotas: dict[str, dict] = {}
         self._usage_info: dict[str, Any] = {}
         self.kwargs = kwargs
+        raw_authuser = kwargs.get("authuser")
+        self.authuser = str(raw_authuser) if raw_authuser is not None else None
 
         if secure_1psid:
             self._cookies.set("__Secure-1PSID", secure_1psid, domain=".google.com", secure=True)
@@ -303,6 +305,7 @@ class GeminiClient(ChatMixin, GemMixin, ResearchMixin):
                     verbose=self.verbose,
                     impersonate=impersonate,
                     verify=self.kwargs.get("verify", True),
+                    authuser=self.authuser,
                 )
 
                 init_session.client.timeout = timeout
@@ -1466,6 +1469,8 @@ class GeminiClient(ChatMixin, GemMixin, ResearchMixin):
             params["bl"] = self.build_label
         if self.session_id:
             params["f.sid"] = self.session_id
+        if self.authuser is not None:
+            params["authuser"] = self.authuser
 
         while True:
             try:
@@ -2313,6 +2318,8 @@ class GeminiClient(ChatMixin, GemMixin, ResearchMixin):
                 params["bl"] = self.build_label
             if self.session_id:
                 params["f.sid"] = self.session_id
+            if self.authuser is not None:
+                params["authuser"] = self.authuser
 
             batch_exec_headers = Headers.BATCH_EXEC.value.copy()
             batch_exec_header = json.loads(batch_exec_headers[MODEL_HEADER_KEY])

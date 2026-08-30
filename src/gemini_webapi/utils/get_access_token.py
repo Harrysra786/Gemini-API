@@ -183,7 +183,10 @@ def _fill_missing(jar: Cookies, extra: Cookies) -> Cookies:
 
 
 async def _send_request(
-    client: AsyncSession, cookies: dict | Cookies, verbose: bool = False
+    client: AsyncSession,
+    cookies: dict | Cookies,
+    verbose: bool = False,
+    authuser: int | str | None = None,
 ) -> Response:
     """Send http request with provided cookies using a shared session."""
     client.cookies.clear()
@@ -193,7 +196,8 @@ async def _send_request(
         for k, v in cookies.items():
             client.cookies.set(k, v, domain=_COOKIE_DOMAIN, secure=True)
 
-    response = await client.get(Endpoint.INIT, headers=Headers.GEMINI.value)
+    params = {"authuser": str(authuser)} if authuser is not None else None
+    response = await client.get(Endpoint.INIT, headers=Headers.GEMINI.value, params=params)
     if verbose:
         logger.debug(
             f"HTTP Request: GET {Endpoint.INIT} [{response.status_code}] (HTTP/{format_http_version(response.http_version)})"
@@ -229,6 +233,7 @@ async def get_access_token(
     verbose: bool = False,
     impersonate: BrowserTypeLiteral = BROWSER_TYPE,
     verify: bool = True,
+    authuser: int | str | None = None,
 ) -> InitSession:
     """Send a get request to gemini.google.com for each group of available cookies and return
     the value of "SNlM0e" as access token on the first successful request.
@@ -395,7 +400,9 @@ async def get_access_token(
 
                 attempts += 1
                 try:
-                    response = await _send_request(client, jar, verbose=verbose)
+                    response = await _send_request(
+                        client, jar, verbose=verbose, authuser=authuser
+                    )
                     if payload := _extract_payload(response):
                         if verbose:
                             logger.debug(f"Init attempt ({attempts}) from {group_name} succeeded.")
