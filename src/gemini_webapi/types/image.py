@@ -5,6 +5,7 @@ from pathlib import Path
 from textwrap import shorten
 from typing import Any
 
+import httpx
 from curl_cffi import CurlFollow, CurlHttpVersion
 from curl_cffi.requests import AsyncSession
 from curl_cffi.requests.exceptions import HTTPError
@@ -12,6 +13,140 @@ from pydantic import BaseModel, ConfigDict
 
 from gemini_webapi.constants import BROWSER_TYPE, Headers, format_http_version
 from gemini_webapi.utils import logger
+
+
+async def _fetch_bytes_resilient(
+    url: str,
+    req_client: AsyncSession | None = None,
+    verbose: bool = False,
+) -> tuple[bytes | None, str | None]:
+    """Attempts to fetch bytes from a URL using multiple fallback strategies.
+
+    Returns (content_bytes, content_type).
+    """
+    # 1. curl_cffi direct (with session cookies if available)
+    if req_client:
+        try:
+            resp = await req_client.get(url)
+            if resp.status_code == 200 and resp.content:
+                ct = resp.headers.get("content-type", "")
+                return resp.content, ct
+        except Exception as e:
+            if verbose:
+                logger.debug(f"curl_cffi direct failed on {url}: {e}")
+
+        # 2. curl_cffi with Referer headers
+        try:
+            resp = await req_client.get(url, headers=Headers.REFERER.value)
+            if resp.status_code == 200 and resp.content:
+                ct = resp.headers.get("content-type", "")
+                return resp.content, ct
+        except Exception as e:
+            if verbose:
+                logger.debug(f"curl_cffi with Referer failed on {url}: {e}")
+
+    # 3. httpx clean
+    try:
+        async with httpx.AsyncClient(follow_redirects=True, timeout=30.0) as client:
+            headers = {
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/133.0.0.0 Safari/537.36"
+                )
+            }
+            resp = await client.get(url, headers=headers)
+            if resp.status_code == 200 and resp.content:
+                ct = resp.headers.get("content-type", "")
+                return resp.content, ct
+    except Exception as e:
+        if verbose:
+            logger.debug(f"httpx clean failed on {url}: {e}")
+
+    # 4. httpx with Referer
+    try:
+        async with httpx.AsyncClient(follow_redirects=True, timeout=30.0) as client:
+            headers = {
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/133.0.0.0 Safari/537.36"
+                ),
+                "Referer": "https://gemini.google.com/",
+            }
+            resp = await client.get(url, headers=headers)
+            if resp.status_code == 200 and resp.content:
+                ct = resp.headers.get("content-type", "")
+                return resp.content, ct
+    except Exception as e:
+        if verbose:
+            logger.debug(f"httpx with Referer failed on {url}: {e}")
+
+    return None, None
+
+
+async def _download_image_chain(
+    start_url: str,
+    req_client: AsyncSession | None = None,
+    max_hops: int = 6,
+    verbose: bool = False,
+) -> tuple[bytes | None, str | None]:
+    """Follows Google's text-URL hop chain (up to max_hops) to download binary image bytes."""
+    curr_url = start_url
+    for hop in range(max_hops):
+        content, ct = await _fetch_bytes_resilient(curr_url, req_client, verbose=verbose)
+        if not content or len(content) == 0:
+            break
+        # Check if content is binary image
+        if (
+            content.startswith(b"\x89PNG")
+            or content.startswith(b"\xff\xd8\xff")
+            or (content.startswith(b"RIFF") and b"WEBP" in content[:16])
+            or (ct and "image" in ct)
+        ):
+            return content, ct
+        # Check if content is a redirect URL text
+        try:
+            txt = content.decode("utf-8").strip()
+            if txt.startswith("http://") or txt.startswith("https://"):
+                curr_url = txt
+                continue
+        except Exception:
+            pass
+        # Neither image nor URL
+        break
+    return None, None
+
+
+def _save_image_content(
+    content: bytes,
+    path_obj: Path,
+    filename: str,
+    content_type: str | None = None,
+    verbose: bool = False,
+) -> str:
+    path_obj_file = Path(filename)
+    if not path_obj_file.suffix:
+        ext = None
+        if content.startswith(b"\x89PNG"):
+            ext = ".png"
+        elif content.startswith(b"\xff\xd8\xff"):
+            ext = ".jpg"
+        elif content.startswith(b"RIFF") and b"WEBP" in content[:16]:
+            ext = ".webp"
+        elif content_type:
+            clean_ct = content_type.split(";")[0].strip().lower()
+            ext = mimetypes.guess_extension(clean_ct)
+
+        if not ext:
+            ext = ".png"
+        filename = f"{filename}{ext}"
+
+    dest = path_obj / filename
+    dest.write_bytes(content)
+    if verbose:
+        logger.info(f"Image saved as {dest.resolve()}")
+    return str(dest.resolve())
 
 
 class Image(BaseModel):
@@ -117,45 +252,40 @@ class Image(BaseModel):
 
     async def _perform_save(
         self, req_client: AsyncSession, path_obj: Path, filename: str, verbose: bool
-     ) -> str:
-        """Base implementation: simple download."""
-        urls_to_try = [self.url]
+    ) -> str:
+        """Base implementation: multi-strategy resilient download."""
+        authuser = getattr(getattr(self, "client_ref", None), "authuser", 0)
+        auth_suffix = f"&authuser={authuser}" if authuser else ""
+
+        urls_to_try = [
+            self.url,
+            f"{self.url}=d-I?alr=yes{auth_suffix}" if "=d-I" not in self.url else self.url,
+        ]
         if "=s2048-rj" in self.url:
             urls_to_try.append(self.url.replace("=s2048-rj", "=s1024-rj"))
             urls_to_try.append(self.url.replace("=s2048-rj", "=s0"))
             urls_to_try.append(self.url.replace("=s2048-rj", ""))
         elif "=s1024-rj" in self.url:
+            urls_to_try.append(self.url.replace("=s1024-rj", "=s2048-rj"))
             urls_to_try.append(self.url.replace("=s1024-rj", "=s0"))
             urls_to_try.append(self.url.replace("=s1024-rj", ""))
+        else:
+            urls_to_try.append(self.url + "=s2048-rj")
+            urls_to_try.append(self.url + "=s1024-rj")
+            urls_to_try.append(self.url + "=s0")
 
-        last_resp = None
         for u in urls_to_try:
-            try:
-                response = await req_client.get(u, headers=Headers.REFERER.value)
-                if response.status_code == 200:
-                    last_resp = response
-                    break
-            except Exception:
-                continue
+            content, ct = await _download_image_chain(u, req_client, verbose=verbose)
+            if content and len(content) > 0:
+                if (
+                    content.startswith(b"\x89PNG")
+                    or content.startswith(b"\xff\xd8\xff")
+                    or (content.startswith(b"RIFF") and b"WEBP" in content[:16])
+                    or (ct and "image" in ct)
+                ):
+                    return _save_image_content(content, path_obj, filename, ct, verbose)
 
-        if last_resp is None or last_resp.status_code != 200:
-            status = getattr(last_resp, 'status_code', 'unknown')
-            reason = getattr(last_resp, 'reason', 'unknown')
-            raise HTTPError(f"Error downloading image: {status} {reason}")
-        response = last_resp
-        path_obj_file = Path(filename)
-        if not path_obj_file.suffix:
-            content_type = response.headers.get("content-type", "").split(";")[0].strip().lower()
-            ext = mimetypes.guess_extension(content_type) or ".png"
-            filename = f"{filename}{ext}"
-
-        dest = path_obj / filename
-        dest.write_bytes(response.content)
-
-        if verbose:
-            logger.info(f"Image saved as {dest.resolve()}")
-
-        return str(dest.resolve())
+        raise HTTPError(f"Error downloading image: all download strategies failed for {self.url}")
 
 
 class WebImage(Image):
@@ -222,6 +352,8 @@ class GeneratedImage(Image):
 
         """
         if full_size:
+            authuser = getattr(self.client_ref, "authuser", 0) if self.client_ref else 0
+            auth_suffix = f"&authuser={authuser}" if authuser else ""
             if all([self.client_ref, self.cid, self.rid, self.rcid, self.image_id]):
                 try:
                     original_url = await self.client_ref._get_full_size_image(
@@ -231,22 +363,33 @@ class GeneratedImage(Image):
                         image_id=self.image_id,
                     )
                     if original_url:
-                        req_url = f"{original_url}=d-I?alr=yes"
-
-                        response = await req_client.get(req_url, headers=Headers.REFERER.value)
-                        response.raise_for_status()
-                        url_text = response.text
-
-                        response = await req_client.get(url_text, headers=Headers.REFERER.value)
-                        response.raise_for_status()
-                        self.url = response.text
-
-                        return await super()._perform_save(req_client, path_obj, filename, verbose)
-
+                        req_url = f"{original_url}=d-I?alr=yes{auth_suffix}"
+                        content, ct = await _download_image_chain(req_url, req_client, verbose=verbose)
+                        if content and len(content) > 0 and (
+                            content.startswith(b"\x89PNG")
+                            or content.startswith(b"\xff\xd8\xff")
+                            or (content.startswith(b"RIFF") and b"WEBP" in content[:16])
+                            or (ct and "image" in ct)
+                        ):
+                            return _save_image_content(content, path_obj, filename, ct, verbose)
                 except Exception as e:
                     logger.debug(
                         f"Failed to fetch full size image URL via RPC: {e}, falling back to default URL suffix."
                     )
+
+            if self.url:
+                try:
+                    req_url = f"{self.url}=d-I?alr=yes{auth_suffix}" if "=d-I" not in self.url else self.url
+                    content, ct = await _download_image_chain(req_url, req_client, verbose=verbose)
+                    if content and len(content) > 0 and (
+                        content.startswith(b"\x89PNG")
+                        or content.startswith(b"\xff\xd8\xff")
+                        or (content.startswith(b"RIFF") and b"WEBP" in content[:16])
+                        or (ct and "image" in ct)
+                    ):
+                        return _save_image_content(content, path_obj, filename, ct, verbose)
+                except Exception:
+                    pass
 
             if "=s1024-rj" in self.url:
                 self.url = self.url.replace("=s1024-rj", "=s2048-rj")
