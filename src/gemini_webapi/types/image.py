@@ -117,16 +117,32 @@ class Image(BaseModel):
 
     async def _perform_save(
         self, req_client: AsyncSession, path_obj: Path, filename: str, verbose: bool
-    ) -> str:
+     ) -> str:
         """Base implementation: simple download."""
-        response = await req_client.get(self.url, headers=Headers.REFERER.value)
-        if verbose:
-            logger.debug(
-                f"HTTP Request: GET {self.url} [{response.status_code}] (HTTP/{format_http_version(response.http_version)})"
-            )
+        urls_to_try = [self.url]
+        if "=s2048-rj" in self.url:
+            urls_to_try.append(self.url.replace("=s2048-rj", "=s1024-rj"))
+            urls_to_try.append(self.url.replace("=s2048-rj", "=s0"))
+            urls_to_try.append(self.url.replace("=s2048-rj", ""))
+        elif "=s1024-rj" in self.url:
+            urls_to_try.append(self.url.replace("=s1024-rj", "=s0"))
+            urls_to_try.append(self.url.replace("=s1024-rj", ""))
 
-        if response.status_code != 200:
-            raise HTTPError(f"Error downloading image: {response.status_code} {response.reason}")
+        last_resp = None
+        for u in urls_to_try:
+            try:
+                response = await req_client.get(u, headers=Headers.REFERER.value)
+                if response.status_code == 200:
+                    last_resp = response
+                    break
+            except Exception:
+                continue
+
+        if last_resp is None or last_resp.status_code != 200:
+            status = getattr(last_resp, 'status_code', 'unknown')
+            reason = getattr(last_resp, 'reason', 'unknown')
+            raise HTTPError(f"Error downloading image: {status} {reason}")
+        response = last_resp
         path_obj_file = Path(filename)
         if not path_obj_file.suffix:
             content_type = response.headers.get("content-type", "").split(";")[0].strip().lower()
