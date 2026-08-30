@@ -1,6 +1,7 @@
 import os
 import tempfile
 import time
+from hashlib import sha256
 from pathlib import Path
 
 import orjson as json
@@ -23,6 +24,14 @@ def _get_cookie_cache_dir() -> Path:
     return Path(_path) if _path else Path(tempfile.gettempdir()) / "gemini_webapi"
 
 
+def get_cookie_cache_path(
+    secure_1psid: str, *, account_alias: str | None = None
+) -> Path:
+    """Return a cache path without embedding a session credential in its name."""
+    cache_key = account_alias or sha256(secure_1psid.encode("utf-8")).hexdigest()
+    return _get_cookie_cache_dir() / f".cached_cookies_{cache_key}.json"
+
+
 def _get_cookies_cache_path(cookies: Cookies, verbose: bool = False) -> Path | None:
     """Helper to get and ensure the cache file path based on __Secure-1PSID."""
     secure_1psid = _extract_cookie_value(cookies, "__Secure-1PSID")
@@ -31,7 +40,7 @@ def _get_cookies_cache_path(cookies: Cookies, verbose: bool = False) -> Path | N
             logger.warning("Cannot save cookies: __Secure-1PSID not found.")
         return None
 
-    return _get_cookie_cache_dir() / f".cached_cookies_{secure_1psid}.json"
+    return get_cookie_cache_path(secure_1psid)
 
 
 async def rotate_1psidts(client: AsyncSession, verbose: bool = False) -> str | None:
