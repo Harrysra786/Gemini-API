@@ -1,11 +1,12 @@
 import hashlib
+import asyncio
 import mimetypes
+import time
 from datetime import datetime
 from pathlib import Path
 from textwrap import shorten
 from typing import Any
 
-import httpx
 from curl_cffi import CurlFollow, CurlHttpVersion
 from curl_cffi.requests import AsyncSession
 from curl_cffi.requests.exceptions import HTTPError
@@ -19,68 +20,26 @@ async def _fetch_bytes_resilient(
     url: str,
     req_client: AsyncSession | None = None,
     verbose: bool = False,
+    request_timeout: float = 8.0,
 ) -> tuple[bytes | None, str | None]:
-    """Attempts to fetch bytes from a URL using multiple fallback strategies.
+    """Fetches bytes through the authenticated Gemini session with a short deadline.
 
-    Returns (content_bytes, content_type).
+    Generated-media URLs frequently require the same cookies as the chat request.
+    Keeping the retrieval on that session is both more reliable and prevents a
+    failing CDN hop from turning one generation into several minutes of waits.
     """
-    # 1. curl_cffi direct (with session cookies if available)
-    if req_client:
+    if not req_client:
+        return None, None
+
+    for headers in (None, Headers.REFERER.value):
         try:
-            resp = await req_client.get(url)
+            request = req_client.get(url, headers=headers) if headers else req_client.get(url)
+            resp = await asyncio.wait_for(request, timeout=request_timeout)
             if resp.status_code == 200 and resp.content:
-                ct = resp.headers.get("content-type", "")
-                return resp.content, ct
-        except Exception as e:
+                return resp.content, resp.headers.get("content-type", "")
+        except (asyncio.TimeoutError, Exception) as exc:
             if verbose:
-                logger.debug(f"curl_cffi direct failed on {url}: {e}")
-
-        # 2. curl_cffi with Referer headers
-        try:
-            resp = await req_client.get(url, headers=Headers.REFERER.value)
-            if resp.status_code == 200 and resp.content:
-                ct = resp.headers.get("content-type", "")
-                return resp.content, ct
-        except Exception as e:
-            if verbose:
-                logger.debug(f"curl_cffi with Referer failed on {url}: {e}")
-
-    # 3. httpx clean
-    try:
-        async with httpx.AsyncClient(follow_redirects=True, timeout=30.0) as client:
-            headers = {
-                "User-Agent": (
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/133.0.0.0 Safari/537.36"
-                )
-            }
-            resp = await client.get(url, headers=headers)
-            if resp.status_code == 200 and resp.content:
-                ct = resp.headers.get("content-type", "")
-                return resp.content, ct
-    except Exception as e:
-        if verbose:
-            logger.debug(f"httpx clean failed on {url}: {e}")
-
-    # 4. httpx with Referer
-    try:
-        async with httpx.AsyncClient(follow_redirects=True, timeout=30.0) as client:
-            headers = {
-                "User-Agent": (
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/133.0.0.0 Safari/537.36"
-                ),
-                "Referer": "https://gemini.google.com/",
-            }
-            resp = await client.get(url, headers=headers)
-            if resp.status_code == 200 and resp.content:
-                ct = resp.headers.get("content-type", "")
-                return resp.content, ct
-    except Exception as e:
-        if verbose:
-            logger.debug(f"httpx with Referer failed on {url}: {e}")
+                logger.debug(f"Authenticated image fetch failed for {url}: {exc}")
 
     return None, None
 
@@ -90,11 +49,18 @@ async def _download_image_chain(
     req_client: AsyncSession | None = None,
     max_hops: int = 6,
     verbose: bool = False,
+    total_timeout: float = 20.0,
 ) -> tuple[bytes | None, str | None]:
     """Follows Google's text-URL hop chain (up to max_hops) to download binary image bytes."""
     curr_url = start_url
+    deadline = time.monotonic() + total_timeout
     for hop in range(max_hops):
-        content, ct = await _fetch_bytes_resilient(curr_url, req_client, verbose=verbose)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        content, ct = await _fetch_bytes_resilient(
+            curr_url, req_client, verbose=verbose, request_timeout=min(8.0, remaining)
+        )
         if not content or len(content) == 0:
             break
         # Check if content is binary image
