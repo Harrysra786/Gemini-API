@@ -4,7 +4,7 @@ import unittest
 from pathlib import Path
 
 from gemini_pool_client import GeminiPoolClient
-from gemini_pool_service import GeminiPool, PoolAccounts, PoolHttpServer
+from gemini_pool_service import EnrollmentBridge, GeminiPool, PoolAccounts, PoolHttpServer
 
 
 class _Image:
@@ -105,7 +105,7 @@ class GeminiPoolTests(unittest.IsolatedAsyncioTestCase):
             pool = GeminiPool(_Accounts(), root / "state")
             token_file = root / "token"
             token_file.write_text("test-token", encoding="utf-8")
-            server = await asyncio.start_server(PoolHttpServer(pool, "test-token").handle, "127.0.0.1", 0)
+            server = await asyncio.start_server(PoolHttpServer(pool, "test-token", EnrollmentBridge(root / "accounts")).handle, "127.0.0.1", 0)
             port = server.sockets[0].getsockname()[1]
             client = GeminiPoolClient(token_file, port=port)
             try:
@@ -118,3 +118,33 @@ class GeminiPoolTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertEqual(result["status"], "ready")
             self.assertEqual(result["account"], "gemini_02")
+
+    async def test_pool_api_arms_a_one_time_enrollment_window(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            token_file = root / "token"
+            token_file.write_text("test-token", encoding="utf-8")
+            bridge = EnrollmentBridge(root / "accounts")
+            server = await asyncio.start_server(PoolHttpServer(GeminiPool(_Accounts(), root / "state"), "test-token", bridge).handle, "127.0.0.1", 0)
+            client = GeminiPoolClient(token_file, port=server.sockets[0].getsockname()[1])
+            try:
+                armed = await client.begin_enrollment()
+            finally:
+                server.close()
+                await server.wait_closed()
+            self.assertEqual(armed["account"], "all")
+            self.assertEqual(bridge.get_pending()["nonce"], armed["nonce"])
+
+    async def test_enrollment_bridge_refreshes_all_aliases_without_exposing_cookie_values(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            bridge = EnrollmentBridge(root)
+            pending = bridge.begin("all")
+            bridge.import_session(
+                {"nonce": pending["nonce"], "secure_1psid": "session-value", "secure_1psidts": "session-ts"}
+            )
+
+            aliases = sorted(item.stem for item in root.glob("gemini_*.json"))
+            self.assertEqual(aliases, [f"gemini_{index:02d}" for index in range(1, 8)])
+            self.assertNotIn("session-value", str(bridge.last_import))
+            self.assertNotIn("session-ts", str(bridge.last_import))

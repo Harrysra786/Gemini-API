@@ -19,6 +19,46 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+
+class EnrollmentBridge:
+    """One-time localhost handoff used by the already-installed Chrome connector."""
+
+    def __init__(self, credentials_root: Path):
+        self.credentials_root = credentials_root
+        self.pending: dict[str, Any] | None = None
+        self.last_import: dict[str, Any] | None = None
+
+    def begin(self, account: str) -> dict[str, Any]:
+        if account not in {"all", *[f"gemini_{index:02d}" for index in range(1, 8)]}:
+            raise ValueError("Account must be all or a gemini_01 through gemini_07 alias.")
+        self.pending = {"account": account, "nonce": secrets.token_urlsafe(24), "expires_at": time.time() + 600}
+        return {"account": account, "nonce": self.pending["nonce"], "expires_in_seconds": 600}
+
+    def get_pending(self) -> dict[str, str] | None:
+        if not self.pending or self.pending["expires_at"] < time.time():
+            self.pending = None
+            return None
+        return {"alias": self.pending["account"], "nonce": self.pending["nonce"]}
+
+    def import_session(self, payload: dict[str, Any]) -> None:
+        pending = self.get_pending()
+        if not pending or payload.get("nonce") != pending["nonce"]:
+            raise ValueError("No active enrollment window.")
+        psid = payload.get("secure_1psid")
+        psidts = payload.get("secure_1psidts", "")
+        if not isinstance(psid, str) or not psid or not isinstance(psidts, str):
+            raise ValueError("Connector did not provide a valid Gemini session.")
+        aliases = [f"gemini_{index:02d}" for index in range(1, 8)] if pending["alias"] == "all" else [pending["alias"]]
+        self.credentials_root.mkdir(parents=True, exist_ok=True)
+        for index, alias in enumerate(aliases):
+            authuser = index if pending["alias"] == "all" else int(payload.get("authuser", 0))
+            target = self.credentials_root / f"{alias}.json"
+            temporary = target.with_suffix(".tmp")
+            temporary.write_text(json.dumps({"secure_1psid": psid, "secure_1psidts": psidts, "authuser": authuser}), encoding="utf-8")
+            temporary.replace(target)
+        self.last_import = {"account": pending["alias"], "at": datetime.now().isoformat(timespec="seconds")}
+        self.pending = None
+
 class PoolAccounts:
     """One Gemini client and one async lock per enrolled alias."""
 
@@ -168,7 +208,8 @@ class GeminiPool:
 class PoolHttpServer:
     """Minimal dependency-free HTTP API; it only accepts loopback clients."""
 
-    def __init__(self, pool: GeminiPool, token: str):
+    def __init__(self, pool: GeminiPool, token: str, enrollment: EnrollmentBridge):
+        self.pool, self.token, self.enrollment = pool, token, enrollment
         self.pool, self.token = pool, token
 
     async def handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
@@ -194,6 +235,9 @@ class PoolHttpServer:
                 payload = json.loads(body or b"{}")
                 job = await self.pool.submit_media(payload["kind"], payload["prompt"], files=payload.get("files"), model=payload.get("model"), account=payload.get("account", "auto"))
                 await self.reply(writer, 202, job)
+            elif method == "POST" and target == "/v1/enroll":
+                payload = json.loads(body or b"{}")
+                await self.reply(writer, 200, self.enrollment.begin(payload.get("account", "all")))
             else:
                 await self.reply(writer, 404, {"error": "not found"})
         except Exception as exc:
@@ -209,16 +253,51 @@ class PoolHttpServer:
         await writer.drain()
 
 
-async def serve(credentials_root: Path, state_root: Path, token_file: Path, port: int) -> None:
+class EnrollmentHttpServer:
+    """Connector-compatible localhost endpoint; no bearer token crosses this boundary."""
+
+    def __init__(self, enrollment: EnrollmentBridge):
+        self.enrollment = enrollment
+
+    async def handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        try:
+            request_line = (await reader.readline()).decode("ascii").strip().split()
+            headers: dict[str, str] = {}
+            while line := await reader.readline():
+                decoded = line.decode("ascii").strip()
+                if not decoded:
+                    break
+                key, value = decoded.split(":", 1)
+                headers[key.lower()] = value.strip()
+            method, target = request_line[0], request_line[1]
+            if method == "GET" and target == "/pending":
+                pending = self.enrollment.get_pending()
+                await PoolHttpServer.reply(writer, 200 if pending else 409, pending or {"error": "no active enrollment"})
+            elif method == "POST" and target == "/import":
+                body = await reader.readexactly(int(headers.get("content-length", "0")))
+                self.enrollment.import_session(json.loads(body))
+                await PoolHttpServer.reply(writer, 200, {"result": "account connected"})
+            else:
+                await PoolHttpServer.reply(writer, 404, {"error": "not found"})
+        except Exception:
+            await PoolHttpServer.reply(writer, 400, {"error": "account connection failed"})
+        finally:
+            writer.close()
+            await writer.wait_closed()
+
+
+async def serve(credentials_root: Path, state_root: Path, token_file: Path, port: int, enrollment_port: int) -> None:
     token_file.parent.mkdir(parents=True, exist_ok=True)
     if not token_file.exists():
         token_file.write_text(secrets.token_urlsafe(32), encoding="utf-8")
     token = token_file.read_text(encoding="utf-8").strip()
     active = {item.strip() for item in os.environ.get("GEMINI_ACTIVE_ACCOUNTS", "").split(",") if item.strip()}
     pool = GeminiPool(PoolAccounts(credentials_root, active or None), state_root)
-    server = await asyncio.start_server(PoolHttpServer(pool, token).handle, "127.0.0.1", port)
-    async with server:
-        await server.serve_forever()
+    enrollment = EnrollmentBridge(credentials_root)
+    server = await asyncio.start_server(PoolHttpServer(pool, token, enrollment).handle, "127.0.0.1", port)
+    connector = await asyncio.start_server(EnrollmentHttpServer(enrollment).handle, "127.0.0.1", enrollment_port)
+    async with server, connector:
+        await asyncio.gather(server.serve_forever(), connector.serve_forever())
 
 
 def main() -> None:
@@ -228,8 +307,9 @@ def main() -> None:
     parser.add_argument("--state", type=Path, required=True)
     parser.add_argument("--token-file", type=Path, required=True)
     parser.add_argument("--port", type=int, default=8767)
+    parser.add_argument("--enrollment-port", type=int, default=8766)
     args = parser.parse_args()
-    asyncio.run(serve(args.credentials, args.state, args.token_file, args.port))
+    asyncio.run(serve(args.credentials, args.state, args.token_file, args.port, args.enrollment_port))
 
 
 if __name__ == "__main__":

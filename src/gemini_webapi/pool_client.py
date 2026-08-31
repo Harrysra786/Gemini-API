@@ -1,4 +1,4 @@
-"""Small async client for a local ``gemini_pool_service`` instance."""
+"""Async client for the local standalone Gemini pool service."""
 
 from __future__ import annotations
 

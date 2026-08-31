@@ -32,3 +32,12 @@ python gemini_pool_service.py serve --credentials <private-account-dir> --state 
 
 The service never returns credential values. Keep the credential directory,
 state directory, and token file accessible only to the local user.
+
+## Refreshing a browser session
+
+The standalone pool also exposes a one-time connector-compatible enrollment
+listener on loopback port `8766`. Arm it through the authenticated pool API,
+then click the existing Gemini account connector within ten minutes. The
+connector sends the browser session only to this local listener; the pool
+updates the seven alias files with `authuser` values `0` through `6` and never
+includes cookie material in its API responses or job records.
