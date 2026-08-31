@@ -106,7 +106,12 @@ class Video(BaseModel):
                 await req_client.close()
 
     async def _perform_save(
-        self, req_client: AsyncSession, path_obj: Path, filename: str, verbose: bool
+        self,
+        req_client: AsyncSession,
+        path_obj: Path,
+        filename: str,
+        verbose: bool,
+        poll_interval: float = 2.0,
     ) -> dict[str, str | None]:
         """Base implementation: simple download."""
         path = await self._download_file(req_client, self.url, path_obj, filename, ".mp4", verbose)
@@ -175,7 +180,12 @@ class GeneratedVideo(Video):
 
     # @override
     async def _perform_save(
-        self, req_client: AsyncSession, path_obj: Path, filename: str, verbose: bool
+        self,
+        req_client: AsyncSession,
+        path_obj: Path,
+        filename: str,
+        verbose: bool,
+        poll_interval: float = 2.0,
     ) -> dict[str, str | None]:
         """Internal method for GeneratedVideo, handling thumbnails and polling."""
         thumb_path = None
@@ -197,8 +207,8 @@ class GeneratedVideo(Video):
             if video_path != "206":
                 return {"video": video_path, "video_thumbnail": thumb_path}
             if verbose:
-                logger.info("Video still generating (206), retrying in 10s...")
-            await asyncio.sleep(10)
+                logger.info(f"Video still generating (206), retrying in {poll_interval}s...")
+            await asyncio.sleep(poll_interval)
 
 
 class GeneratedMedia(GeneratedVideo):
@@ -257,6 +267,7 @@ class GeneratedMedia(GeneratedVideo):
         filename: str,
         verbose: bool,
         download_type: Literal["audio", "video", "both"] = "both",
+        poll_interval: float = 2.0,
     ) -> dict[str, str | None]:
         """Internal method for GeneratedMedia, handling audio/video downloads and polling.
 
@@ -292,6 +303,7 @@ class GeneratedMedia(GeneratedVideo):
                     ".mp3",
                     verbose,
                     "audio",
+                    poll_interval,
                 )
             )
             if self.mp3_thumbnail:
@@ -316,6 +328,7 @@ class GeneratedMedia(GeneratedVideo):
                     ".mp4",
                     verbose,
                     "video",
+                    poll_interval,
                 )
             )
             if self.thumbnail:
@@ -343,14 +356,15 @@ class GeneratedMedia(GeneratedVideo):
         ext: str,
         verbose: bool,
         key: str,
+        poll_interval: float,
     ) -> tuple[str, str | None]:
         while True:
             path = await Video._download_file(req_client, url, path_obj, filename, ext, verbose)
             if path != "206":
                 return key, path
             if verbose:
-                logger.info(f"Media ({key}) still generating (206), retrying in 10s...")
-            await asyncio.sleep(10)
+                logger.info(f"Media ({key}) still generating (206), retrying in {poll_interval}s...")
+            await asyncio.sleep(poll_interval)
 
     @staticmethod
     async def _download_thumbnail(
